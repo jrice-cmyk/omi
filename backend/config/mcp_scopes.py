@@ -18,14 +18,15 @@ MCP_DEFAULT_API_KEY_SCOPES = [
     "screen_activity.read",
     "people.read",
     "people.rename",
-    "people.create",
-    "speakers.assign",
 ]
 
 # Never granted implicitly -- not to legacy keys, not to newly created keys, not
 # by default. Dismissal is reversible in storage but removes a record from normal
 # product reads, so it requires an explicit request at key/consent time.
-MCP_OPT_IN_SCOPES = ["people.cleanup"]
+# ``people.create`` and ``speakers.assign`` are the first People/speaker-label
+# writes on this surface (and ``speakers.assign`` can feed voice learning), so
+# existing keys are never widened to them silently.
+MCP_OPT_IN_SCOPES = ["people.cleanup", "people.create", "speakers.assign"]
 
 # Everything a caller may legitimately ask for.
 MCP_SUPPORTED_SCOPES = MCP_DEFAULT_API_KEY_SCOPES + MCP_OPT_IN_SCOPES

@@ -5,7 +5,9 @@
 (``utils.speaker_assignment_teaching.commit_manual_assignment``), so label
 provenance, person label evidence, superseded-sample retirement, and voice
 learning stay one implementation. ``create_person`` mirrors the REST
-``POST /v1/users/people`` contract: idempotent by name, 2-40 characters.
+``POST /v1/users/people`` contract: idempotent by name (through the same
+transactional get-or-create, so concurrent or retried same-name calls share one
+person), 2-40 characters.
 
 Write responses carry ids and counts only, never transcript text or speech
 samples, so a write grant does not widen what the caller can read.
@@ -17,7 +19,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import database.users as users_db
+import database.people as people_db
 from utils.executors import postprocess_executor, submit_with_context
 from utils.memory.product_authorization import ProductAuthorizationContext
 from utils.mcp_memories import parse_mcp_bool
@@ -29,8 +31,8 @@ from utils.mcp_server.constants import (
     MCP_SPEAKER_ASSIGN_MAX_SEGMENT_IDS,
 )
 from utils.mcp_server.errors import ToolExecutionError
+from utils.mcp_server.handlers.conversations import is_safe_conversation_id
 from utils.speaker_assignment_teaching import commit_manual_assignment
-from utils.speaker_permissions import named_speaker_prompts_allowed
 
 ASSIGNEE_USER = "user"
 
@@ -65,11 +67,17 @@ def _required_text(value: Any, field: str, *, max_chars: int) -> str:
     return text
 
 
+def _document_id(value: Any, field: str) -> str:
+    # Firestore refuses ``/``, ``.``, ``..`` and ``__*__`` ids; reject them here
+    # so malformed input answers invalid_arguments instead of an internal error.
+    document_id = _required_text(value, field, max_chars=MCP_CONVERSATION_ID_MAX_BYTES)
+    if not is_safe_conversation_id(document_id):
+        raise ToolExecutionError(f"{field} is not a valid id", code=-32602)
+    return document_id
+
+
 def _conversation_id(value: Any) -> str:
-    conversation_id = _required_text(value, "conversation_id", max_chars=MCP_CONVERSATION_ID_MAX_BYTES)
-    if len(conversation_id.encode("utf-8")) > MCP_CONVERSATION_ID_MAX_BYTES:
-        raise ToolExecutionError("conversation_id is too long", code=-32602)
-    return conversation_id
+    return _document_id(value, "conversation_id")
 
 
 def _speaker_id(value: Any) -> Optional[int]:
@@ -119,10 +127,10 @@ def assign_speaker(
         raise ToolExecutionError(str(e), code=-32602)
 
     is_user = assignee == ASSIGNEE_USER
-    person_id = None if is_user else assignee
-    # Same entitlement the app's manual assignment routes apply today.
-    if person_id is not None and not named_speaker_prompts_allowed(uid):
-        raise ToolExecutionError("Naming other people needs a paid plan.", code=-32002)
+    # No separate naming entitlement: the app's manual assignment routes dropped
+    # theirs in #20252, and the two surfaces stay aligned. The commit still
+    # enforces conversation access (PermissionError below).
+    person_id = None if is_user else _document_id(assignee, "assignee")
 
     try:
         raw, resolved, _removed, _before = commit_manual_assignment(
@@ -173,15 +181,15 @@ def create_person(
             f"name must be {MCP_PERSON_NAME_MIN_CHARS} to {MCP_PERSON_NAME_MAX_CHARS} characters", code=-32602
         )
 
-    existing = users_db.get_person_by_name(uid, name)
-    if existing:
-        return {
-            "success": True,
-            "created": False,
-            "person": {"id": existing.get("id", ""), "name": existing.get("name", name)},
-        }
-
     now = datetime.now(timezone.utc)
-    person = {"id": str(uuid.uuid4()), "name": name, "created_at": now, "updated_at": now}
-    users_db.create_person(uid, person)
-    return {"success": True, "created": True, "person": {"id": person["id"], "name": name}}
+    draft_id = str(uuid.uuid4())
+    # One transaction decides lookup-or-create, as on the REST route, so parallel
+    # agent calls with the same name cannot mint duplicate people.
+    person = people_db.get_or_create_person_by_name(
+        uid, {"id": draft_id, "name": name, "created_at": now, "updated_at": now}
+    )
+    return {
+        "success": True,
+        "created": person.id == draft_id,
+        "person": {"id": person.id, "name": getattr(person, "name", None) or name},
+    }

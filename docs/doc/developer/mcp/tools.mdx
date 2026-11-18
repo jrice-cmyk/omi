@@ -375,11 +375,12 @@ segments were labeled. It contains no transcript text.
 only when the user has confirmed the label: Omi then learns that voice from the
 labeled segments, exactly as when the user labels a speaker in the app. Voice
 learning for other people still follows the user's "save other voice profiles"
-setting. Naming a person other than the user requires the same plan as naming
-people in the app.
+setting. As in the app, naming a person other than the user needs no separate
+plan; access to the conversation itself is still checked.
 
-OAuth clients must request `people.create` and `speakers.assign` explicitly; the
-default grant contains read scopes only.
+`people.create` and `speakers.assign` are opt-in, like `people.cleanup`: OAuth
+clients and API keys must request them explicitly, and existing or newly created
+default keys never receive them automatically.
 
 ---
 

@@ -53,7 +53,8 @@ def _auth(scopes=None):
     return MCPAuthContext(
         uid=UID,
         auth_type='oauth',
-        scopes=list(MCP_FULL_ACCESS_SCOPES if scopes is None else scopes),
+        # The write scopes are opt-in, so a caller that uses them requested them explicitly.
+        scopes=list(MCP_FULL_ACCESS_SCOPES + ['people.create', 'speakers.assign'] if scopes is None else scopes),
         client_id='test-client',
         memory_context=SimpleNamespace(kind='ctx'),
     )
@@ -96,9 +97,7 @@ def world(monkeypatch):
     taught = {'person': [], 'owner': []}
     monkeypatch.setattr(teaching_tasks, 'run_authorized_person_learning', lambda **kw: taught['person'].append(kw))
     monkeypatch.setattr(teaching_tasks, 'run_authorized_owner_learning', lambda **kw: taught['owner'].append(kw))
-    plan = SimpleNamespace(paid=True, checks=[])
-    monkeypatch.setattr(speakers, 'named_speaker_prompts_allowed', lambda uid: plan.checks.append(uid) or plan.paid)
-    return SimpleNamespace(store=store, deferred=deferred, taught=taught, plan=plan)
+    return SimpleNamespace(store=store, deferred=deferred, taught=taught)
 
 
 def _stored(world):
@@ -141,7 +140,6 @@ class TestAssignSpeakerEndToEnd:
         # The receipt withholds teaching authorization, so no later retry can learn from it either.
         assert receipt['speakers']['4']['use_for_speech_training'] is False
         assert world.deferred == []
-        assert world.plan.checks == [UID]
 
     def test_training_opt_in_queues_person_voice_learning_after_commit(self, world):
         response = _call(
@@ -159,23 +157,20 @@ class TestAssignSpeakerEndToEnd:
         assert kwargs['uid'] == UID and kwargs['person_id'] == PERSON and kwargs['conversation_id'] == CONV
         assert sorted(kwargs['segment_ids']) == ['s0', 's1']
 
-    def test_owner_label_by_segment_ids_skips_plan_check(self, world):
-        world.plan.paid = False
+    def test_owner_label_by_segment_ids(self, world):
         response = _call('assign_speaker', {'conversation_id': CONV, 'segment_ids': ['s2', 's2'], 'assignee': 'user'})
 
         assert _structured(response)['updated_segment_count'] == 1
         assert _structured(response)['assignee'] == 'user'
         assert _stored_segments(world)['s2']['is_user'] is True
-        assert world.plan.checks == []
         assert world.deferred == []
 
-    def test_naming_a_person_follows_the_app_plan_gate(self, world):
-        world.plan.paid = False
+    def test_naming_a_person_has_no_separate_plan_gate_like_the_app_routes(self, world):
+        # #20252 removed the named-person entitlement from the app's manual
+        # assignment routes; the MCP surface stays aligned with them.
+        assert not hasattr(speakers, 'named_speaker_prompts_allowed')
         response = _call('assign_speaker', {'conversation_id': CONV, 'speaker_id': 4, 'assignee': PERSON})
-
-        assert response['result']['isError'] is True
-        assert _structured(response)['error']['code'] == 'paid_plan_required'
-        assert _stored_receipt(world) == {}
+        assert _structured(response)['assignee'] == PERSON
 
     def test_response_carries_no_transcript_text(self, world):
         response = _call('assign_speaker', {'conversation_id': CONV, 'speaker_id': 4, 'assignee': PERSON})
@@ -232,6 +227,12 @@ class TestAssignSpeakerValidation:
             },
             {'conversation_id': '  ', 'assignee': 'user', 'speaker_id': 0},
             {'conversation_id': CONV, 'assignee': '', 'speaker_id': 0},
+            # Firestore-invalid document ids answer invalid_arguments, not internal.
+            {'conversation_id': 'a/b', 'assignee': 'user', 'speaker_id': 0},
+            {'conversation_id': '..', 'assignee': 'user', 'speaker_id': 0},
+            {'conversation_id': '__reserved__', 'assignee': 'user', 'speaker_id': 0},
+            {'conversation_id': CONV, 'assignee': 'people/x', 'speaker_id': 0},
+            {'conversation_id': CONV, 'assignee': '.', 'speaker_id': 0},
             {'conversation_id': CONV, 'assignee': 'user', 'speaker_id': 0, 'use_for_speech_training': 'sometimes'},
         ],
     )
@@ -281,45 +282,58 @@ class TestDeferredAssignmentTasks:
 
 
 class TestCreatePerson:
-    def test_creates_person_and_returns_id_and_name_only(self):
-        with (
-            patch.object(speakers.users_db, 'get_person_by_name', return_value=None) as lookup,
-            patch.object(speakers.users_db, 'create_person') as create,
-        ):
+    def test_creates_person_through_the_transactional_get_or_create(self):
+        def get_or_create(uid, data):
+            return SimpleNamespace(id=data['id'], name=data['name'])
+
+        with patch.object(
+            speakers.people_db, 'get_or_create_person_by_name', side_effect=get_or_create
+        ) as get_or_create_mock:
             response = _call('create_person', {'name': '  Ada Lovelace  '})
         result = _structured(response)
         assert result['success'] is True and result['created'] is True
         assert result['person']['name'] == 'Ada Lovelace'
-        lookup.assert_called_once_with(UID, 'Ada Lovelace')
-        stored = create.call_args.args[1]
-        assert create.call_args.args[0] == UID
+        get_or_create_mock.assert_called_once()
+        uid, stored = get_or_create_mock.call_args.args
+        assert uid == UID
         assert stored['id'] == result['person']['id'] and stored['name'] == 'Ada Lovelace'
         assert stored['created_at'].tzinfo is timezone.utc and stored['updated_at'] == stored['created_at']
 
     def test_existing_name_is_returned_without_samples(self):
-        existing = {
-            'id': 'p-existing',
-            'name': 'Sam',
-            'speech_samples': ['gs://secret'],
-            'speech_sample_transcripts': ['private words'],
-            'speaker_embedding': [0.1],
-            'created_at': datetime(2026, 1, 1, tzinfo=timezone.utc),
-        }
-        with (
-            patch.object(speakers.users_db, 'get_person_by_name', return_value=existing),
-            patch.object(speakers.users_db, 'create_person') as create,
-        ):
+        existing = SimpleNamespace(
+            id='p-existing',
+            name='Sam',
+            speech_samples=['gs://secret'],
+            speech_sample_transcripts=['private words'],
+            speaker_embedding=[0.1],
+        )
+        with patch.object(speakers.people_db, 'get_or_create_person_by_name', return_value=existing):
             response = _call('create_person', {'name': 'Sam'})
         assert _structured(response) == {
             'success': True,
             'created': False,
             'person': {'id': 'p-existing', 'name': 'Sam'},
         }
-        create.assert_not_called()
+
+    def test_concurrent_same_name_calls_share_the_survivor(self):
+        # The transaction (not a check-then-create in the handler) decides: every
+        # call goes through it, and whoever loses the race gets the winner back.
+        survivor = {}
+
+        def get_or_create(uid, data):
+            person = survivor.setdefault(data['name'], SimpleNamespace(id=data['id'], name=data['name']))
+            return person
+
+        with patch.object(speakers.people_db, 'get_or_create_person_by_name', side_effect=get_or_create) as mock:
+            first = _structured(_call('create_person', {'name': 'Sam'}))
+            second = _structured(_call('create_person', {'name': 'Sam'}))
+        assert mock.call_count == 2
+        assert first['created'] is True and second['created'] is False
+        assert first['person']['id'] == second['person']['id']
 
     @pytest.mark.parametrize('name', ['', ' a ', 'x' * 41, None, 5])
     def test_name_follows_rest_people_bounds(self, name):
-        with patch.object(speakers.users_db, 'create_person') as create:
+        with patch.object(speakers.people_db, 'get_or_create_person_by_name') as create:
             response = _call('create_person', {'name': name})
         assert _structured(response)['error']['code'] == 'invalid_arguments'
         create.assert_not_called()
@@ -340,7 +354,7 @@ class TestScopesAndRateLimits:
         assert 'scope="speakers.assign"' in response['error']['data']['_meta']['mcp/www_authenticate']
         commit.assert_not_called()
 
-        with patch.object(speakers.users_db, 'create_person') as create:
+        with patch.object(speakers.people_db, 'get_or_create_person_by_name') as create:
             response = _call('create_person', {'name': 'Sam'}, auth)
         assert response['error']['code'] == -32003
         create.assert_not_called()
@@ -353,7 +367,11 @@ class TestScopesAndRateLimits:
             )['result']['tools']
         }
         assert {'assign_speaker', 'create_person'}.isdisjoint(listed(['people.read']))
-        assert {'assign_speaker', 'create_person'} <= listed(list(MCP_FULL_ACCESS_SCOPES))
+        # Opt-in: the default/full-access grant never includes them implicitly.
+        assert {'assign_speaker', 'create_person'}.isdisjoint(listed(list(MCP_FULL_ACCESS_SCOPES)))
+        assert {'assign_speaker', 'create_person'} <= listed(
+            list(MCP_FULL_ACCESS_SCOPES) + ['people.create', 'speakers.assign']
+        )
         assert listed(['speakers.assign']) == {'assign_speaker'}
 
     @pytest.mark.parametrize(

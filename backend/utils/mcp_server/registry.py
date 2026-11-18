@@ -1367,7 +1367,8 @@ TOOL_SPECS: Tuple[ToolSpec, ...] = (
             "use_for_speech_training=true; only set it when the user confirms the label is correct, because it "
             "teaches Omi that voice."
         ),
-        annotations=_edit_annotations("Assign speaker"),
+        # Not idempotent: a retry with use_for_speech_training=true can queue voice learning again.
+        annotations=_create_annotations("Assign speaker", idempotent=False),
         input_schema={
             "type": "object",
             "properties": {
@@ -1395,6 +1396,10 @@ TOOL_SPECS: Tuple[ToolSpec, ...] = (
                 },
             },
             "required": ["conversation_id", "assignee"],
+            "anyOf": [
+                {"required": ["speaker_id"]},
+                {"required": ["segment_ids"]},
+            ],
         },
         output_schema=_output_schema(
             _object_schema(

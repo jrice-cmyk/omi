@@ -33,7 +33,7 @@ SCOPE_PERMISSION_TEXT = {
     "people.rename": "Correct the names of people Omi has recognized",
     "people.cleanup": "Dismiss false-positive people from your Omi account",
     "people.create": "Add people to your Omi account",
-    "speakers.assign": "Label who is speaking in your Omi conversations",
+    "speakers.assign": "Label speakers in your Omi conversations and optionally use labeled audio for voice learning",
 }
 
 

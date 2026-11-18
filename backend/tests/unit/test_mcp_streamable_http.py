@@ -983,6 +983,12 @@ class TestToolResultContract:
         assert by_name["create_person"]["annotations"]["idempotentHint"] is True
         assert by_name["assign_speaker"]["annotations"]["readOnlyHint"] is False
         assert by_name["assign_speaker"]["annotations"]["destructiveHint"] is False
+        # A retry with use_for_speech_training=true can queue voice learning again.
+        assert by_name["assign_speaker"]["annotations"]["idempotentHint"] is False
+        assert by_name["assign_speaker"]["inputSchema"]["anyOf"] == [
+            {"required": ["speaker_id"]},
+            {"required": ["segment_ids"]},
+        ]
 
     def test_non_serializable_results_are_json_safe(self):
         class Opaque:
@@ -1333,11 +1339,10 @@ class TestOAuthResourceCanonicalization:
             "screen_activity.read",
             "people.read",
             "people.rename",
-            "people.create",
-            "speakers.assign",
         ]
-        assert config_scopes.MCP_OPT_IN_SCOPES == ["people.cleanup"]
-        assert "people.cleanup" not in util_scopes.MCP_FULL_ACCESS_SCOPES
+        assert config_scopes.MCP_OPT_IN_SCOPES == ["people.cleanup", "people.create", "speakers.assign"]
+        for scope in config_scopes.MCP_OPT_IN_SCOPES:
+            assert scope not in util_scopes.MCP_FULL_ACCESS_SCOPES
 
     def test_sse_suffixed_env_resource_is_canonicalized(self, monkeypatch):
         """A stale ``/v1/mcp/sse`` MCP_RESOURCE_URL must still advertise the

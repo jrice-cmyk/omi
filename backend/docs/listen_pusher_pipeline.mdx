@@ -3685,7 +3685,8 @@ labels: `complete`, `gap`, `uncertain_timing`, `download_limit`, `decode_failed`
 The hosted MCP `assign_speaker` tool (`utils/mcp_server/handlers/speakers.py`,
 scope `speakers.assign`) commits through the same
 `utils.speaker_assignment_teaching.commit_manual_assignment` as the REST routes
-and applies the same named-person plan check. It differs in one default:
+and, like them since #20252, applies no separate named-person plan check. It
+differs in one default:
 `use_for_speech_training` is false unless the caller sets it, so an agent's label
 records `use_for_speech_training: false` on the receipt and authorizes no
 teaching. Follow-up tasks run on `postprocess_executor` after commit, because a
