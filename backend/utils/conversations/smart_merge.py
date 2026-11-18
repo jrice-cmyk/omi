@@ -68,6 +68,7 @@ from utils.conversations.factory import deserialize_conversation
 from utils.conversations.summary_delivery import PROCESS_CONTEXT, present as summary_present
 from config.merge_ancestry import flatten_updates
 from utils.conversations.merge_conversations import copy_sync_bridge_audio, retract_sync_bridge_source
+from utils.episodes import member_notes
 from utils.conversations.process_conversation import process_conversation, save_structured_vector
 from utils.conversations.processing_trigger import ProcessingTrigger
 from utils.conversations.smart_merge_policy import (
@@ -95,6 +96,7 @@ from utils.conversations.smart_merge_policy import (
 from utils.conversations.smart_merge_state import QUESTION_NAME, QUESTIONS, build_state, state_sha256
 from utils.executors import lifecycle_executor, run_blocking
 from utils.llm.jev_client import ask_jev
+from utils.sync.repeat_work_metrics import conversation_scope
 from utils.metrics_smart_merge import record_merge_processing_stage
 from utils.metrics import (
     record_conversation_smart_merge,
@@ -103,6 +105,7 @@ from utils.metrics import (
     record_smart_merge_flatten,
 )
 from utils.observability.fallback import record_fallback
+from utils.observability.finalization import finalization_diagnostic_id
 from utils.other.storage import compute_audio_files_fingerprint, enqueue_conversation_artifact_build
 
 logger = logging.getLogger(__name__)
@@ -148,6 +151,7 @@ async def smart_merge_step(
     )
 
 
+@conversation_scope
 def decide_and_apply(
     uid: str,
     conversation_id: str,
@@ -355,8 +359,10 @@ def _pair_state(
         if last is None:
             return None
         last_row = last_fragment_row if isinstance(last_fragment_row, Mapping) else survivor
-        a = replace(last, started_at=last_row['created_at'], finished_at=last_row['finished_at'])
-        b = replace(b, started_at=new_row['created_at'])
+        recorded = fragment_of(last_row)
+        if recorded is None:
+            return None
+        a = replace(last, started_at=recorded.started_at, finished_at=recorded.finished_at)
         candidates = [fragment for fragment in fragments if fragment.id != last.id]
         a_segments = (
             fragment_segments(survivor, survivor_segments, last)
@@ -793,6 +799,8 @@ def finish_absorb(uid: str, donor_id: str, *, owner: str, resumed: bool = False)
         _cleanup_flattened_ancestors(uid, donor_id, donor, survivor_id)
         step = 'refresh'
         refresh_survivor(uid, survivor_id, owner=owner)
+    except member_notes.LiveMemberNotesDeferred:
+        raise  # Scheduling waits retain donor custody without spending retry budget.
     except Exception as error:
         # Bounded: no ids, no message text (provider errors can quote transcript).
         logger.warning('event=smart_merge outcome=incomplete step=%s cause=%s', step, _incomplete_cause(error))
@@ -800,7 +808,8 @@ def finish_absorb(uid: str, donor_id: str, *, owner: str, resumed: bool = False)
             raise
         raise SmartMergeIncomplete(type(error).__name__) from error
     if resumed:
-        logger.info('event=smart_merge outcome=resumed_ok')
+        # Closed vocabulary: the hash only, never the raw finalization job id.
+        logger.info('event=smart_merge outcome=resumed_ok job_hash=%s', finalization_diagnostic_id(owner))
 
 
 _DEFERRED_RETRACTION = (DestructiveOperationInProgress, LegalHoldActive, LegalHoldAuthorityUnavailable)
@@ -938,6 +947,9 @@ def _refresh_claimed(uid: str, survivor_id: str, claimed: int, *, owner: str, sk
     if int(state.get('processed_revision') or 0) < claimed or state.get('processed_sync_revision') != row.get(
         'sync_content_revision'
     ):
+        from utils.sync.repeat_work_metrics import record_survivor_refresh
+
+        record_survivor_refresh(uid, survivor_id, row.get('episode_id'))
         persistence = {'owned': True}
         try:
             processed = process_conversation(
@@ -953,6 +965,8 @@ def _refresh_claimed(uid: str, survivor_id: str, claimed: int, *, owner: str, sk
                 persistence_observer=lambda owned: persistence.__setitem__('owned', owned),
                 smart_merge_refresh=(claimed, owner),
             )
+        except member_notes.LiveMemberNotesDeferred:
+            raise  # Outer custody owner releases the lease and schedules the wait.
         except Exception:
             record_conversation_smart_merge_refresh('failed')
             raise

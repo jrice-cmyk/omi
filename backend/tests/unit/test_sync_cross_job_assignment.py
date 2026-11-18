@@ -16,6 +16,7 @@ import pytest
 
 from tests.unit.fixtures.strict_firestore_transaction import StrictFirestore
 from utils.sync.assignment import assign_in_transaction, needs_fragment_review
+from utils.sync.absorption_metrics import record_assignment_metrics
 from utils.sync.assignment_errors import SyncAssignmentSuperseded
 from database.batch_pipeline_privacy import BatchPrivacyBlocked, assert_batch_write_allowed
 
@@ -46,7 +47,7 @@ def chunk(key, timestamp, text='A narrated explanation of this chapter.', device
 def intake(store, incoming, *, candidate_id=None, target_id=None):
     # Two independent clients share only their durable store, never a job lock.
     with store.lock:
-        return assign_in_transaction(
+        result = assign_in_transaction(
             store.transaction(),
             store.collection('users').document('u'),
             incoming,
@@ -56,6 +57,10 @@ def intake(store, incoming, *, candidate_id=None, target_id=None):
             encode=deepcopy,
             invalidate=lambda payload: None,
         )
+        # Production consumes transient metric observations immediately after
+        # the successful transaction, before rows can be reused or processed.
+        record_assignment_metrics(result[0])
+        return result
 
 
 def conversations(store):
@@ -287,6 +292,8 @@ def test_filler_is_preserved_and_promoted_regardless_of_speakers(is_user, speake
     assert not created and promoted['id'] == review['id']
     assert promoted['sync_relevance'] == 'keep'
     assert promoted['discarded'] is False
+    assert promoted['relevance_decision']['verdict'] == 'keep'
+    assert promoted['relevance_decision']['trigger'] == 'sync_intake'
 
 
 @pytest.mark.parametrize('text', ['Help!', 'Yes', 'No', '嗯，请明天联系我', 'I love you', 'Mm 1234', '1234', ''])
@@ -302,6 +309,7 @@ def test_subsecond_meaningful_speech_is_kept(text):
     result, _, _ = intake(StrictFirestore(), short)
     assert result['sync_relevance'] == 'keep'
     assert result['discarded'] is False
+    assert result['relevance_decision']['verdict'] == 'keep'
 
 
 def test_separated_fillers_wait_for_finalization_without_losing_transcript_or_audio():
@@ -721,3 +729,48 @@ def test_adapter_preserves_live_sync_target_quiet_check(monkeypatch):
     incoming['data_protection_level'] = 'standard'
     db.assign_sync_conversation('u', incoming, target_id='live', firestore_client=store)
     assert store.rows[job_path]['status'] == 'waiting_quiet'
+
+
+@pytest.mark.parametrize('decided_by', ['model', 'jev', 'deterministic', 'rule'])
+@pytest.mark.parametrize('initial_text', ['Mm-hmm.', 'We agreed to meet on Friday.'])
+def test_meaningful_append_invalidates_automatic_discard_of_older_content(decided_by, initial_text):
+    from utils.conversations.fragment_visibility import is_relevance_discarded
+
+    store = StrictFirestore()
+    first = chunk('filler', 1000, initial_text)
+    initial, _, _ = intake(store, first)
+    stored = store.rows[('users', 'u', 'conversations', initial['id'])]
+    stored.update(
+        discarded=True,
+        relevance_decision=dict(
+            verdict='discard',
+            decided_by=decided_by,
+            reason='filler_only' if decided_by == 'rule' else 'model_discard',
+            arm='jev',
+        ),
+    )
+    revision = stored['sync_content_revision']
+    # A transport replay is not new content and must retain its assessed verdict.
+    replay, _, _ = intake(store, first)
+    if decided_by != 'rule':
+        assert replay['relevance_decision'] == stored['relevance_decision']
+        assert is_relevance_discarded(replay)
+    promoted, _, _ = intake(store, chunk('meaningful', 1060, 'Please call the doctor tomorrow.'))
+    assert promoted['sync_content_revision'] > revision
+    assert promoted['sync_relevance'] == 'keep' and not promoted['discarded']
+    assert promoted['relevance_decision'] is None
+    assert not is_relevance_discarded(promoted)
+
+
+def test_more_filler_does_not_invalidate_a_final_model_discard():
+    from utils.conversations.fragment_visibility import is_relevance_discarded
+
+    store = StrictFirestore()
+    initial, _, _ = intake(store, chunk('filler', 1000, 'Mm-hmm.'))
+    stored = store.rows[('users', 'u', 'conversations', initial['id'])]
+    decision = dict(verdict='discard', decided_by='model', reason='model_discard')
+    stored.update(discarded=True, relevance_decision=decision)
+    expanded, _, _ = intake(store, chunk('more', 1060, 'Hmm.'))
+    assert expanded['sync_relevance'] == 'review'
+    assert expanded['relevance_decision'] == decision
+    assert is_relevance_discarded(expanded)

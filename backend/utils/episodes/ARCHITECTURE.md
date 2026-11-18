@@ -38,13 +38,13 @@ one capture window's evidence.
      retains the buffer for one `MOMENT_PAUSE_SECONDS` reconnect window, then
      flushes the tail if no reconnect arrives. Finalization and Wrap Up flush it
      sooner when they run.
-   - The first episode moment is checked against the episode's original start
-     across every member conversation. At `MAX_EPISODE_SECONDS`, the old episode
-     closes and continued speech starts a new one at the cap boundary. Provisional
-     items for a continuing member transfer to the successor for finalization
-     reconciliation. While an episode is live, the Home row timer uses its
-     `started_at`; during rotation it holds the prior anchor until the successor
-     row is visible.
+   - The hard cap is four hours from the episode's recorded `started_at`.
+     Moment count only bounds the stored presentation list; it cannot close an
+     occasion. A continuing conversation stays with its original episode after
+     the cap or an explicit close. Only a different conversation opens the next
+     episode. Finalization retains the original member's evidence and reconciles
+     its provisional items on that owner.
+
 2. When a moment ends, `service.record_moment` runs on `postprocess_executor` as
    a tracked background task:
    - **Boundary** (`policy.boundary`): the hard cap (`MAX_EPISODE_SECONDS`), a gap at
@@ -100,15 +100,14 @@ one capture window's evidence.
    only recorded activity; old audio cannot replace current activity with
    ingestion time. With no covering episode, sync creates a **closed** episode
    at its recorded start/end and leaves both `current` and `last_closed`
-   navigation pointers alone. Retry membership is stable inside its recorded window and notes still
-   use the existing transactional content receipts. A later append extends
-   the same member's recorded window before notes recovery. A conversation that
-   crosses a four-hour or existing explicit boundary remains one storage row
-   referenced by successive closed windows, just like a live cap rotation.
-   Its membership link records all windows and names the latest one. Recovery
-   assigns each placed segment to its start window once, clamps moment clocks
-   at the cap, and retains unplaced evidence in the first window. Receipts
-   remain global to the conversation, so retries cannot duplicate the text.
+   navigation pointers alone. Membership is singular and checked in the same
+   transaction as each link write, including live commits, updates and reopens.
+   A capture crossing the cap stays in its starting episode, whose visible
+   recorded window stops at four hours or the following episode. All retained
+   speech (including the tail beyond the cap) is recovered once into that owner;
+   recovery cannot substitute an upload-time `finished_at` for recorded activity.
+   The timeline fence and metadata-window guard reject overlapping recorded
+   windows before any writes.
    A later **fresh live** capture may resume a silence-closed owner under the
    timeline/current-pointer fence; late intake never calls that transition.
    Explicit closes and the four-hour boundary stay closed. Finalization
@@ -228,12 +227,116 @@ The close reasons are `user`, `gap`, `idle`, `hard_cap`, `source_change`,
   (`idle`), dated when the quiet reached the gap rather than when the read
   happened. No scheduler is involved.
 
+## Composed summary (David, 2026-10-31)
+
+The live notes above are a preview. Once an episode is closed and every retained
+member conversation has finished processing, `composer.compose` writes the
+episode's final notes in one `episode_composer` call (gpt-6-luna, low effort):
+- Input: each member's own summary (title, overview, action items) plus the
+  episode's full transcript with clock times. Above `COMPOSER_MAX_TRANSCRIPT_CHARS`
+  (about 60k tokens; the 4h cap makes this rare) the densest 10-minute windows
+  are kept in time order and the gaps are marked.
+- Output (v2) replaces `title`, `emoji`, `lede` (one or two sentences; also
+  `bullets` = [lede] for released clients), `follow_ups`, `people` and `moments`:
+  1-8 chapters, each with 2-5 `points` (text plus up to a few `details`). The
+  episode page renders each chapter as a section, like a conversation summary,
+  and opens it in its conversation's transcript via `start_offset`/`end_offset`.
+  Transcript labels and chapter times are HH:MM:SS; a chapter without an end runs
+  to its recording's last line before the next chapter. Placeholder or
+  out-of-span chapters are dropped. Member ends move `member_activity`, so a late
+  member extends the episode's end. `lede` and `follow_ups` live in the encrypted
+  `content` blob with the other notes.
+- `composer_version` changes recompose an episode once on read.
+- `composed_fingerprint` covers retained members, every member's transcript text
+  and timing, and its own summary and action items. This full fingerprint remains
+  the paid-call lease and composed-state stamp. With the default-on
+  `EPISODE_COMPOSE_SETTLE_ENABLED` switch, `composed_evidence` separately hashes
+  each member's speech text and resolved `person_name`; `composed_membership`
+  stamps the retained member set. Label/summary/timing-only drift does not buy
+  another call. Real speech, a name change, late membership or a discard still
+  recomposes. `summary_needs_regeneration` forces it. An episode with no
+  speech is stamped once instead of retried.
+- `composed_notes` hashes the composed title, notes and moment headings. A later
+  per-moment write over them (a closing conversation's tail, a sync replay) still
+  records membership as before, and the next compose sees the drift and rewrites
+  the notes. `composed_member_ids` lets a read notice a member discarded or
+  deleted directly on its conversation after the compose.
+- One paid call per evidence across replicas: a `compose_lease` (fingerprint,
+  150 s) is claimed by CAS before the model call. After the call the members are
+  re-read; changed evidence returns `superseded` without writing (its own trigger
+  composes again). Failures count `compose_failures`; the read-side net backs off
+  10/20/40 minutes and stops after four until the evidence changes.
+- Chapter clock times are mapped on the same clock as the transcript labels and
+  must fall inside the episode's transcript span (two-minute slack).
+- With `EPISODE_LIVE_MEMBER_CLOSE_ENABLED` (default on), a closed episode excludes
+  still-capturing live members from readiness and summary inputs. The compose tick
+  rehomes post-gap live members atomically; true pre-boundary members retain their
+  owner and recompose after finishing.
+- A pending member transcript waits for `episode_compose_transcript_wait_seconds()`
+  (20 minutes by default), measured from its pending stamp. After expiry the
+  episode can compose the available speech; a later transcript receipt schedules
+  one refresh for its new evidence. `EPISODE_COMPOSE_TRANSCRIPT_WAIT_SECONDS`
+  overrides the deadline (clamped to 0–86400 seconds); setting it to 21600 restores
+  the former six-hour wait without a build.
+- Background close/finalize triggers wait for `COMPOSER_SETTLE_SECONDS` (two
+  quiet minutes), capped at `COMPOSER_MAX_SETTLE_SECONDS` (five minutes) from
+  the first pending arrival. `compose_pending_since` and
+  `compose_activity_at` track arrival time without changing recorded boundaries.
+  A tracked async task requeues process-local due work without occupying composer
+  workers; shutdown cancels it. Finalizes and reads recover pending work after
+  restart using the persisted window (no new durable queue or sweeper). A paid
+  background `stale`/`superseded` result starts a fresh quiet window before retry,
+  including when the previous window reached its cap. Read-side schedules
+  (`throttle=True`) promote pending work immediately. Foreground retries, direct
+  `compose` and `force=True` bypass settling. Turning the switch off restores the
+  full-fingerprint scheduling and immediate-retry behavior. No composer version
+  bump or eager recompose wave.
+  Persisted pending work remains read-eligible with the switch off, so rollback
+  after restart drains it immediately. With the switch on, a later trigger
+  retains the persisted first-pending cap; a read bypasses the quiet window.
+  If pending-state persistence fails, finalizers still schedule and workers
+  bypass settling, retaining the normal fingerprint/lease checks. This favors
+  paying over losing new speech or names and emits shared fallback telemetry.
+  Legacy episodes have no narrow trigger stamp: an unchanged full fingerprint
+  backfills it without a paid call. A changed full fingerprint conservatively
+  composes once behind the background settle window, because the old hash cannot
+  distinguish label drift from new speech. That successful compose seeds the
+  narrow stamp, so subsequent label-only finalizes skip. No historical backfill
+  or production-data migration is required.
+- `omi_episode_compose_total{outcome,trigger}` counts runs by outcome and bounded
+  trigger (`close|read|member_final|settle`); `omi_episode_compose_seconds` carries
+  the same labels. `omi_episode_compose_calls_total{trigger,outcome}` counts each
+  paid model call, including `trigger="repair"`.
+  `omi_episode_compose_trigger_skipped_total{reason="evidence_unchanged"}` counts
+  avoided triggers. All have bounded labels and no user identifiers.
+- Triggers: close, member finalize (including `sync_update`, gated on the changed
+  member already loaded by finalization), a late member attaching to an
+  already-composed closed episode (`EPISODE_COMPOSE_LATE_ATTACH_ENABLED`, default
+  on; the attach memo can suppress the later finalize), and a
+  read-side safety net in `home_read.project_episodes` for a closed episode that
+  is uncomposed, drifted or whose visible members changed, closed over a minute
+  ago (at most two per read, each episode at most every ten minutes per process).
+  Runs on a small background pool, one run per episode at a time; never raises.
+- `project_episodes` and the conversation list leave out completed below-floor
+  rows permanently, regardless of capture duration, age or lane, unless the user
+  curated them. Only unsettled provisional rows have a two-hour hold deadline. Lookups and
+  search still reach it. Kill switch `HOME_HIDE_BELOW_FLOOR_ROWS` (on unless set off, read
+  per request; changing it takes a new backend revision). Telemetry:
+  `omi_episode_home_members_total{outcome}`.
+- Kill switch `EPISODE_COMPOSER` (on unless set off): off restores the live
+  notes as the final notes. Telemetry: `omi_episode_compose_total{outcome,trigger}`,
+  `omi_episode_compose_seconds` and `omi_episode_compose_calls_total{trigger,outcome}`;
+  usage adds `composer_*` counters.
+- `EPISODE_COMPOSER_THRIFT` (on unless set off) keeps paid composes: one repair
+  retry over the bad output alone, a title-and-lede compose for short episodes,
+  superseded results stored and marked pending, and a two-paid-failure cap. Off
+  restores discard-and-retry and the four-failure cap.
+
 ## Kill switch, cohort and client capability
 
 `config/episodes.py`:
 - `EPISODES_ENABLED` defaults on and is the kill switch.
-- `EPISODES_PERCENT` (default 100) and `EPISODES_UID_ALLOWLIST`
-  select the admitted cohort. The allowlist bypasses the percentage.
+- Every nonempty owner is admitted while the kill switch is on.
 
 Off makes `/v1/episodes/*` report `enabled: false`. Apps keep today's
 per-conversation UI, and episode lifecycle reads, writes and model calls stop.
@@ -281,6 +384,10 @@ builds, the desktop app and web never call any `/v1/episodes` route.
 - `omi_episode_provisional_items_total{outcome}`
 - `omi_episode_wrapup_latency_seconds`
 - `omi_episode_boundary_total`
+- `omi_episode_f_gate_total{reason}`: first candidate privacy refusal at Variant F settlement;
+  `held|client_processing|deferred|local_pending|local_only|row_consent|user_consent|locked_discarded|owner|status|hidden|other`
+- `omi_episode_f_fallback_total{site}`: fallback attribution by distinct bounded call site;
+  existing shared fallback reason values stay unchanged
 - `omi_episode_moments_skipped_no_client_total{trigger}`: admitted moments (and
   finalization tails, `trigger=finalize`) skipped because no capable client was seen
 - `omi_episode_live_sessions_total{client_seen}`: admitted live conversations at
@@ -291,3 +398,222 @@ builds, the desktop app and web never call any `/v1/episodes` route.
 
 The shared `utils.metrics` exporter imports these collectors, so the backend,
 listen and pusher `/metrics` routes expose the same bounded-label families.
+
+## Live integrity and grouped completion
+
+A confirmed capture-group join schedules one canonical recovery, including
+`desktop` groups, with the admitted `capture_group` trigger. Other members join
+as hidden duplicates and contribute no additional moments or model work. Metadata attachment runs
+before short-tail/model checks, and completed finalizer replays repeat the hook.
+Grouping and primary-note refresh never substitute for episode membership.
+
+Known discarded/deleted/absorbed captures cannot open an episode or update its
+activity. Per-member recorded clocks let a later discard remove only that
+member's contribution without a stale notes CAS restoring it. A retained hidden
+membership does not extend the quiet window. API visibility suppresses episodes
+with no retained members independently of the occasion-relevance kill switch.
+
+## Recorded span and time index (Phase A)
+
+Conversation storage writes `recorded_start`, `recorded_end`, `arrival_at` and
+`clock` for all channels, before compressing/encrypting transcript. The flat
+API fields come from `models.recorded_span.RecordedSpan`. `conversation_span`
+is the sole legacy derivation: placed transcript/frame offsets, then a sync
+recording receipt or named speech end, then an imported extent. A live empty
+stub is a point; its processing end never proves audio. Legacy derivation is
+read-only and tagged `legacy`; an old row's creation/admission timestamp is only
+an arrival estimate. There is no backfill. Live segment and sync CAS writes
+refresh the span with the accepted transcript, preserving first arrival.
+
+`utils.episodes.service.episode_at(uid, T)` answers recorded ownership without
+opening or closing anything. `episodes_between(uid, start, end)` returns ordered
+overlapping windows, paging on the built-in `started_at` index. Windows are
+half open; quiet ownership ends at last recorded activity plus 30 minutes,
+clipped to the four-hour cap. Explicit boundaries stay closed. Candidate
+queries used for placement still allow a late prefix to join the same occasion.
+New historical episodes retain their recorded member intervals. A late bridge
+or earlier prefix recomputes that component in recorded order in one fenced
+transaction, including its four-hour cuts. This makes cap placement independent
+of arrival order. Old episode IDs redirect to the resulting window. Existing
+live/user/calendar boundaries stay authoritative; no historical scan/backfill
+is performed outside intake. Member/window/query budgets fail closed.
+
+Home list membership suppression is default-on via `HOME_HIDE_EPISODE_MEMBERS`,
+but requires admission, `episodes:client_seen` and this client's held replacement.
+`X-Omi-Home-Episode-Ids` carries at most 50 exact `episode_id:conversation_id`
+pairs from loaded metadata; larger or malformed headers are ignored. One
+batch validates at most five exact episode documents for members on this page;
+remaining members stay visible. Redirects are not followed. The server checks
+extant, unmerged episodes and
+retained completed members; unknown/unfetched episodes and unfinished rows stay
+visible. Old clients send no acknowledgement and keep their rows. The response's
+`X-Omi-Conversation-Page-Size` preserves the original page cursor and
+`X-Omi-Home-Suppressed-Ids` identifies omissions whose exact held snapshots the
+app retains locally, so replacing the overlay cannot orphan those members.
+Search and other filtered consumers do not opt in. No membership or title is
+written by this read projection. Turning member hiding off also restores ordinary
+list-version checks and cacheability, even when the client sends the header.
+A list read idle-closes at most two episodes, scheduling compose in that call
+outside the missed-compose cap. A successful close reuses its committed document;
+a lost close/activity CAS reads one exact snapshot, without redirect traversal.
+Other idle episodes keep their source rows while waiting for a later read.
+The bounded missed-compose safety net still covers other closed episodes.
+
+`HOME_NEUTRAL_MINIMUM_TITLES` defaults on. Home neutralizes floor/short server
+minimums (including exact legacy first-sentence matches when speech is already
+loaded) and the exact eight-word lazy placeholder. User edits, model provenance,
+ordinary titles and dead-letter terminal titles survive. Indexed lists and member
+metadata never refetch transcripts to infer provenance. Off restores stored titles.
+`EPISODE_OUTPUT_LANGUAGE_PIN=off` restores preference-then-capture resolution on
+conversation and episode paths. With the pin on, a supplied transcript must agree
+with a non-English capture tag; omitted segments retain the capture fallback.
+
+Each membership CAS writes `conversation.episode_id` alongside its overlay
+link. A conversation crossing the cap stays with its starting episode; only
+a different conversation starts the next window. An attach-before-create
+link is adopted by the conversation create transaction without fabricating a
+conversation. Episode writes retain `EPISODES_CLIENT_CHANNELS` admission; span
+writes are global. No new composite index or reconciliation is required.
+
+Boundary arithmetic cannot read ambient wall time. Pollers supply `arrival_at`
+to evaluate recorded quiet deadlines; recorded coordinates determine edges and
+activity. Moment buffering receives both recorded time and arrival explicitly;
+only cache eviction uses arrival. Live conversation cap checks and reconnect/
+calendar-continuation admission consume the same span; continuation timers
+receive explicit `arrival_at`. Missing recorded origins are never reconstructed
+from a creation/arrival timestamp. End-only legacy metadata keeps its declared
+legacy fallback until a normal writer supplies recording evidence. Missing live cap-hold capture coordinates
+fail closed before acknowledging audio custody.
+
+`LIFECYCLE_V2_MODE` remains: the flag registry still says pending/default-shadow
+with zero default serve percent, and it also gates recovery/executor behavior.
+Typed-span readers do not depend on this unfinished rollout. No runtime flag or
+production state is read or modified by this change.
+
+Read-only Phase B sizing: `omi_conversation_llm_calls_total{feature,outcome}`
+counts observed LangChain completions/errors and direct Jev dispatch attempts
+in processing, live-moment and smart-merge conversation scopes regardless
+of the revision-reuse flag. Content-free `repeat_work` log joins identify each
+conversation using an account-scoped hash. `omi_episode_survivor_refreshes_total`
+counts actual refresh processing attempts by assigned/unassigned membership;
+`episode_survivor_refresh` logs hash conversation and episode IDs for per-episode
+counts. Retries count as attempts. These measurements do not change LLM work,
+read production data, or add persistent measurement writes. Labels have fixed
+vocabularies; no user/conversation/episode ID appears in a metric label.
+
+Recorded-component membership reads use batches of at most 50 inside the same
+transaction, before any writes, so a busy component can retain all reverse
+links. Relevance and duplicate-capture discovery widen legacy `finished_at`
+prefilters by the shared clock-skew tolerance; recorded spans still decide
+adjacency and overlap, including delayed ingestion.
+
+Explicit closes store `recorded_end` from retained members' typed recorded spans,
+clipped to the hard cap and the next recorded episode. `closed_at` remains the
+close event time; it is never a new recorded ownership edge. The time index and
+all overlap guards use `recorded_end` for explicit closes. The existing hard-cap
+kill switch also disables the live activity clamp and automatic cap close.
+A late discard removes that member's moments and items, clears the mixed summary,
+and marks it for regeneration before later valid speech can reuse it.
+
+### Occasion membership and late discard repair
+
+`occasion_retention` returns `occasion_member` only after a metadata-only,
+recorded-timeline transaction claims that exact episode and writes both
+`episode_links/{conversation_id}` and the conversation's `episode_id`. This
+runs inside relevance, before desktop `client_finalize` fanout can delay or
+skip its post-finalization hook. A changed owner or failed claim retains the
+clip as `occasion_lookup_unavailable`; it never reports uncommitted membership.
+The write requires episode cohort admission, the capable-client marker and the
+recorded-time switch. Without admission, read-only proof still keeps content as
+`occasion_context`, without claiming membership. The normal desktop and pendant
+finalize hooks remain idempotent safety nets. A changed past-cap owner is rejected
+before the immutable-owner shortcut can report success.
+Claims into automatic historical episodes also update `recorded_members` in the
+same transaction, so later canonical repartition retains the claimed capture.
+
+`sync_relevance` is intake's `keep`/`review` hint, not the final keep/discard
+verdict. It can remain `keep` when a later model assessment discards content.
+Episode attachment, recorded activity, finalization and API visibility use the
+shared final-discard predicate (`fragment_visibility.is_relevance_discarded`),
+including restore authority, instead of interpreting that hint as visibility.
+A discard CAS re-reads retained members' recorded spans and recomputes the
+start and end for live and closed episodes, applying the cap from the retained
+start. Recompute only when the discarded set changes or membership changes in an
+episode with discarded members; notes-only updates reuse the repaired bounds.
+Discard repair retries with a fresh episode after
+a notes CAS wins the race. Legacy compressed/encrypted transcript evidence is
+decoded before deriving spans; processing `finished_at` is never used to
+reconstruct a legacy member's end. Reconstruction uses the new attachment's
+clipped recorded boundary, so retained spans cannot extend it across the next
+episode. Hidden memberships remain for
+recovery and single ownership; they contribute no clocks or visible row.
+
+Recorded attachment preserves a cross-source overlap interval before adding the
+new member/source. Both recovered content and the desktop finalization tail skip
+segments fully inside the original device's recorded interval, even when relevance attached
+first. Earlier prefixes and later segments beyond that interval remain eligible for notes; confirmed
+capture groups continue to use their canonical member.
+
+A historical episode whose start advanced after discard keeps its original ID.
+Canonical partitioning checks every destination document before writing and uses
+a deterministic displaced ID when an unrelated episode or redirect occupies it.
+It never overwrites that episode's retained members, notes or reverse links.
+
+When atomic sync intake appends meaningful speech, its new content revision
+invalidates an older automatic model/Jev/deterministic discard. Transport replays
+and content still needing fragment review retain the assessment; user decisions remain authoritative.
+The final-discard predicate continues to ignore the intake hint itself.
+
+Batch audio close attaches membership before queued transcription/finalization.
+`routers.listen.batch_close` preserves the archive barrier and reuses its existing
+conversation reread. `utils.episodes.batch_close` checks ownership, privacy,
+retention and episode/recorded-time admission, then calls `service.attach_recorded`
+with committed audio bounds. Live and sync attachment use that same primitive;
+neither the current pointer nor processing time selects a batch capture's owner.
+This metadata-only attachment is an explicit exception to the client-seen rule
+above: ownership must exist before transcription, even when an older client has
+not acknowledged episodes. It retains episode and recorded-time admission,
+adds no model work, and does not change paid-work gates. An attachment error
+emits shared `record_fallback` degraded telemetry before finalization repairs it.
+
+The scoped `EPISODE_BATCH_CLOSE_ATTACH_ENABLED` kill switch defaults on. Off
+restores attach-after-transcription without changing live/sync attachment.
+The membership transaction stamps a pending start and a fixed 2h transcription
+deadline on the conversation, using `config.batch_timeliness.SLA_SECONDS` (normal
+target: 30m). Close replay does not renew the deadline or bump the canonical
+recorded component's state version or timeline fence. Home reads use the durable
+`record_projection_revision` delivery receipt: until it exists they show
+“Transcribing…” / processing, then “Couldn't transcribe” / failed on terminal
+failure or deadline expiry. A late projection restores normal metadata. Audio
+bounds still supply a finish time if finalization failed before writing one.
+The unlabeled overdue-read counter counts observations, not unique members.
+Its info alert is staged beside the existing batch timeliness rules; idle
+members remain covered by queue timeliness monitoring. No production alert
+or runtime configuration is changed here.
+## One Home processing row (owner ruling, 2026-11-15)
+
+Home shows at most one processing row directly below the live episode, or at
+the top of Today without live capture. It represents every pending recording
+and closed episode for that day, even across finished rows. Finished episodes
+keep their own rows; terminal failures never enter the processing aggregate.
+The aggregate's page must retain links to every source episode and recording.
+The one-row invariant holds before capability negotiation and through 404/read
+errors. Server capability controls date/failure policy, never the row limit.
+Without confirmed day policy, pending work across days joins Today's one row;
+unknown steps say Transcribing and subtitles show a pending recording count.
+Processing Delete rechecks its initially displayed IDs against current cards,
+owners and conversations after confirmation. Any changed scope cancels the
+whole action with a notice; Undo only receives the exact current records that
+were staged. A READY member or composed replacement cannot be deleted through
+a stale processing confirmation.
+
+This is a client presentation contract. The episode API preserves distinct
+episode IDs and membership, and the conversation list preserves `episode_id`.
+Released clients reconstruct owners from those fields and sort by recording
+time independently of server response order. Rewriting them into a synthetic
+owner would also change detail, delete and acknowledgement semantics. A blank
+client aggregate must not resolve its page to the first overlapping episode:
+that would lose the other members. Server queue and compose waits can expose
+more pending objects, but cannot enforce this display rule on an old client.
+`tests/unit/test_home_pending_identity_contract.py` pins source identity and
+step preservation; Flutter Home tests own aggregation, placement and reachability.

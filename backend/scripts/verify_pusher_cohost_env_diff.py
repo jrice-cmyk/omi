@@ -35,6 +35,19 @@ ROOT = Path(__file__).resolve().parents[2]
 ENVIRONMENTS = ("dev", "prod")
 
 REQUIRED_IDENTICAL_LITERALS = (
+    "PUSHER_RECORD_CLOSE_NOTIFY_ENABLED",
+    "PUSHER_RECORD_CLOSE_FAST_PATH_ENABLED",
+    # Episode context, completeness and notes run on both cohosts. Missing bindings refuse the roll.
+    "EPISODE_COMPOSER_DEFAULT_CONTEXT_ENABLED",
+    "EPISODE_COMPOSER_CONTEXT_ENABLED",
+    "EPISODE_COMPOSER_DETAIL_ENABLED",
+    "EPISODE_COMPOSE_TRANSCRIPT_WAIT_ENABLED",
+    "EPISODE_COMPOSE_TRANSCRIPT_READY_ENABLED",
+    "EPISODE_COMPOSE_SETTLED_TERMINAL_ENABLED",
+    "EPISODE_COMPOSE_ANCHORED_WAIT_ENABLED",
+    "EPISODE_EMPTY_MEMBER_CLEANUP_ENABLED",
+    "HOME_SETTLED_EMPTY_WIRE_ENABLED",
+    "CONVERSATION_NOTES_SCALED_DETAIL_ENABLED",
     "MEMORY_ENABLED",
     "MEETING_NOTES_EVIDENCE_WAIT_SECONDS",
     "CLIENT_SUMMARIES_AT_CAP_ENABLED",
@@ -79,13 +92,44 @@ _DEMAND_LISTEN_ONLY = frozenset(
         'STT_LIVE_DEMAND_MIN_DWELL_SECONDS',
     }
 )
+# Only the listen receive loop promotes unexpected local-preview audio.
+_PREVIEW_CUSTODY_LISTEN_ONLY = frozenset({'LISTEN_PREVIEW_BATCH_CUSTODY_ENABLED'})
 # Only listen WebSocket reconnects run the stale-page scanner. Pusher consumes
 # admitted jobs; this kill switch must not disable their finalization/retries.
 _RECONNECT_RECOVERY_LISTEN_ONLY = frozenset({'STALE_IN_PROGRESS_RECOVERY_ENABLED'})
+# main.py owns the singleton replay pass. Pusher consumes finalizations but
+# never schedules that pass; copying this binding there would imply ownership
+# it does not have. Live admission's dispatch mode remains unchanged.
+_FINALIZATION_REPLAY_LISTEN_ONLY = frozenset(
+    {
+        'LISTEN_FINALIZATION_REPLAY_ENABLED',
+        'LISTEN_FINALIZATION_TASKS_QUEUE',
+        'LISTEN_FINALIZATION_TASKS_HANDLER_URL',
+        'LISTEN_FINALIZATION_TASKS_INVOKER_SA',
+        'LISTEN_FINALIZATION_TASKS_MAX_ATTEMPTS',
+    }
+)
 # main.py owns sync intake, recovery RPC and serving startup. pusher.main mounts
 # none of those surfaces and never starts the dedicated GPU process.
 _BATCH_PIPELINE_LISTEN_ONLY = frozenset(
     {
+        # Held expiry/requeue is owned by main.py maintenance/RPC and GPU workers;
+        # pusher does not run the held maintenance loop or worker failure writer.
+        'BATCH_HELD_DEAD_LETTER_ENABLED',
+        # main.py owns the record intake drain; pusher.main never starts it.
+        'RECORD_SEAL_REPAIR_FRESH_ENABLED',
+        # Only main.py admits native record units; pusher never assigns GPU queue priority.
+        'RECORD_INTAKE_AGE_PRIORITY_ENABLED',
+        'BATCH_INPUT_EXPIRING_ENABLED',
+        'RECORD_FRESH_MERGE_ENABLED',
+        'RECORD_NOTES_EAGER_ENABLED',
+        'RECORD_FOLLOWUP_WAKE_ENABLED',
+        'RECORD_SEAL_WAKE_PRESERVED_ENABLED',
+        'BATCH_CONTROL_CANDIDATE_FANOUT',
+        'BATCH_ADMISSION_PARALLEL_CALLS',
+        'BATCH_PIPELINE_IDLE_POLL_MAX_SECONDS',
+        # Listen admits/suppresses managed live STT; pusher only retains audio.
+        'SERVER_BATCH_UNSUPPORTED_LANGUAGES',
         'BATCH_PIPELINE_ENABLED',
         'BATCH_PIPELINE_UID_ALLOWLIST',
         'BATCH_PIPELINE_SERVING_ENABLED',
@@ -113,16 +157,31 @@ _BATCH_PIPELINE_LISTEN_ONLY = frozenset(
         'BUCKET_BATCH_PIPELINE',
     }
 )
+_RECORD_LATENCY_LISTEN_ONLY = frozenset(
+    {
+        'RECORD_FRESH_MERGE_ENABLED',
+        'RECORD_NOTES_EAGER_ENABLED',
+        'RECORD_FOLLOWUP_WAKE_ENABLED',
+        'RECORD_SEAL_WAKE_PRESERVED_ENABLED',
+    }
+)
 LISTEN_ONLY_ALLOWED: dict[str, frozenset[str]] = {
     "dev": frozenset(
         {
+            # Listen mounts sync upload admission; pusher never accepts sync filenames.
+            "SYNC_FUTURE_CAPTURE_CLAMP_ENABLED",
+            # The unlimited_v2 backfill/import day cap is enforced by listen
+            # admission and the Cloud Run sync/batch hosts through the shared
+            # funded allowance; pusher never admits managed transcription
+            # against a user-day.
+            "UNLIMITED_V2_BACKFILL_HOURS_CAP_ENABLED",
+            "UNLIMITED_V2_BACKFILL_HOURS_CAP_HOURS",
             # Managed listen-only STT rollout; pusher is not a live audio receiver.
             "PARAKEET_BATCH_PRESSURE_MIN_REPLICAS",
             "PARAKEET_BATCH_PRESSURE_POOL_HOST",
             "PARAKEET_WINDOW_ALLOCATION_PERCENT",
             "PARAKEET_WINDOW_DIARIZATION",
             # Pusher never creates a window decoder or owns its delivery deadline.
-            "PARAKEET_WINDOW_DEADLINE_CUT_ENABLED",
             "PARAKEET_WINDOW_DEADLINE_CUT_POST_LATENCY_SECONDS",
             "PARAKEET_WINDOW_MAX_SESSIONS",
             "PARAKEET_WINDOW_MAX_CONTEXT_SECONDS",
@@ -136,7 +195,6 @@ LISTEN_ONLY_ALLOWED: dict[str, frozenset[str]] = {
             "STT_RESILIENT_RECONNECT",
             "STT_FAILOVER_RECOVERY_ENABLED",
             "STT_LEARNED_LANGUAGE_PROFILE",
-            "STT_MULTI_LANGUAGE_HINTS",
             "STT_NON_EN_MULTI_PREFER_HINTABLE_PERCENT",
             # Fleet live routing and runway polling run on backend-listen only.
             "STT_NO_TEXT_SECONDS",
@@ -147,6 +205,7 @@ LISTEN_ONLY_ALLOWED: dict[str, frozenset[str]] = {
             "STT_ROUTING_REDIS_TIMEOUT_SECONDS",
             # Sync HTTP intake is mounted by main.py; pusher mounts no sync router.
             "SYNC_FINALIZE_TARGET_RECOVERY_ENABLED",
+            "SYNC_BRIDGE_CONTAINED_DONOR_MERGE_ENABLED",
             "ACCOUNT_CUTOVER_ENFORCEMENT",
             "DESKTOP_UPDATE_POINTERS_MODE",
             "DESKTOP_UPDATE_RECONCILE_SAMPLE_RATE",
@@ -210,33 +269,55 @@ LISTEN_ONLY_ALLOWED: dict[str, frozenset[str]] = {
     | _TRANSLATION_LISTEN_ONLY
     | _REVIEW_SURFACE_LISTEN_ONLY
     | _DEMAND_LISTEN_ONLY
+    | _PREVIEW_CUSTODY_LISTEN_ONLY
     | _RECONNECT_RECOVERY_LISTEN_ONLY
     | _BATCH_PIPELINE_LISTEN_ONLY,
     "prod": frozenset(
         {
+            # Prod holds CPU projection off; pusher never constructs Projector.
+            "BATCH_PIPELINE_SILENCE_READ_SKIP_ENABLED",
+            # Occasion stitching runs only in the /v4/listen session (routers/listen/runtime.py);
+            # pusher opens no client listen socket.
+            "OCCASION_CONVERSATIONS_ENABLED",
+            # Listen mounts sync upload admission; pusher never accepts sync filenames.
+            "SYNC_FUTURE_CAPTURE_CLAMP_ENABLED",
+            # The unlimited_v2 backfill/import day cap is enforced by listen
+            # admission and the Cloud Run sync/batch hosts through the shared
+            # funded allowance; pusher never admits managed transcription
+            # against a user-day.
+            "UNLIMITED_V2_BACKFILL_HOURS_CAP_ENABLED",
+            "UNLIMITED_V2_BACKFILL_HOURS_CAP_HOURS",
             # Only listen's runtime reads these to advertise mobile control-channel
             # admission. Pusher never grants permission; sync archives unconditionally.
             "MOBILE_STANDARD_BATCH_ENABLED",
             "MOBILE_STANDARD_BATCH_PERCENT",
-            "MOBILE_STANDARD_BATCH_UIDS",
-            # Only listen reads the mobile server-batch-only cohort: server_batch.selected via
+            # Only listen reads the mobile/web server-batch-only cohorts: server_batch.selected via
             # request_eligible and via eligible <- create_in_progress_conversation, both called only
             # from routers/listen. Pusher's finalizer uses owned/has_audio and never admits capture.
             "SERVER_BATCH_ONLY_MOBILE_PERCENT",
+            # Same listen-only admission path for learned auto-language mobile/web captures.
+            "SERVER_BATCH_ONLY_AUTO_LANGUAGE_PERCENT",
+            "SERVER_BATCH_ONLY_WEB_PERCENT",
             # Managed listen-only STT rollout; pusher is not a live audio receiver.
             "PARAKEET_BATCH_PRESSURE_MIN_REPLICAS",
             "PARAKEET_BATCH_PRESSURE_POOL_HOST",
             "PARAKEET_WINDOW_ALLOCATION_PERCENT",
             "PARAKEET_WINDOW_DIARIZATION",
             # Pusher never creates a window decoder or owns its delivery deadline.
-            "PARAKEET_WINDOW_DEADLINE_CUT_ENABLED",
             "PARAKEET_WINDOW_DEADLINE_CUT_POST_LATENCY_SECONDS",
             "PARAKEET_WINDOW_MAX_SESSIONS",
             "PARAKEET_WINDOW_FIRST_TEXT_DEADLINE_SECONDS",
             "PARAKEET_WINDOW_MAX_EMPTY_STREAK",
+            # Listen-only live-window kill switch (routerbench 2026-10-30).
+            "PARAKEET_WINDOW_REPLICA_RECOVERY_ENABLED",
             "PARAKEET_WINDOW_MAX_CONTEXT_SECONDS",
             "PARAKEET_WINDOW_PACE_SECONDS",
             "PARAKEET_WINDOW_POST_TIMEOUT_SECONDS",
+            # Listen-only Soniox idle-close treatment cohort; pusher opens no Soniox stream.
+            "SONIOX_IDLE_COHORT_PERCENT",
+            "SONIOX_IDLE_COHORT_CLOSE_SECONDS",
+            "SONIOX_IDLE_COHORT_REARM_SECONDS",
+            "SONIOX_IDLE_COHORT_MAX_CLOSES_PER_HOUR",
             "SONIOX_CIRCUIT_COOLDOWN_SECONDS",
             "SONIOX_CIRCUIT_FAILURE_THRESHOLD",
             "STT_ACCOUNT_CIRCUIT_COOLDOWN_SECONDS",
@@ -246,7 +327,6 @@ LISTEN_ONLY_ALLOWED: dict[str, frozenset[str]] = {
             "STT_FAILOVER_RECOVERY_ENABLED",
             "STT_NO_TEXT_RESCUE_ENABLED",
             "STT_LEARNED_LANGUAGE_PROFILE",
-            "STT_MULTI_LANGUAGE_HINTS",
             "STT_NON_EN_MULTI_PREFER_HINTABLE_PERCENT",
             # Staged sync-lineage rollout: the live revision fence runs in listen
             # transcript writes; pusher reaches no sync intake or live-write site.
@@ -260,9 +340,12 @@ LISTEN_ONLY_ALLOWED: dict[str, frozenset[str]] = {
             "STT_ROUTING_REDIS_TIMEOUT_SECONDS",
             # Sync HTTP intake is mounted by main.py; pusher mounts no sync router.
             "SYNC_FINALIZE_TARGET_RECOVERY_ENABLED",
+            "SYNC_BRIDGE_CONTAINED_DONOR_MERGE_ENABLED",
             "ACCOUNT_CUTOVER_ENFORCEMENT",
             "ACCOUNT_DELETION_DISPATCH_MODE",
             "ACCOUNT_DELETION_TASKS_QUEUE",
+            # Conversation purge/erasure dispatch runs in main.py's reconciler; pusher never enqueues it.
+            "CONVERSATION_ERASURE_TASKS_QUEUE",
             "BETA_PROMOTION_TOKEN",
             "DESKTOP_UPDATE_POINTERS_MODE",
             "DESKTOP_UPDATE_RECONCILE_SAMPLE_RATE",
@@ -285,7 +368,6 @@ LISTEN_ONLY_ALLOWED: dict[str, frozenset[str]] = {
             "GCP_LOCATION",
             "GEMINI_API_KEY",
             "HOSTED_PUSHER_API_URL",
-            "HOSTED_TRANSLATION_API_URL",
             "HOSTED_VAD_API_URL",
             "LISTEN_FINALIZATION_BYOK_ABANDONMENT_ENABLED",
             "LISTEN_FINALIZATION_ORPHAN_STALE_SECONDS",
@@ -323,8 +405,10 @@ LISTEN_ONLY_ALLOWED: dict[str, frozenset[str]] = {
     | _TRANSLATION_LISTEN_ONLY
     | _REVIEW_SURFACE_LISTEN_ONLY
     | _DEMAND_LISTEN_ONLY
+    | _PREVIEW_CUSTODY_LISTEN_ONLY
     | _RECONNECT_RECOVERY_LISTEN_ONLY
-    | (_BATCH_PIPELINE_LISTEN_ONLY - {'BATCH_PIPELINE_UID_ALLOWLIST'}),
+    | (_BATCH_PIPELINE_LISTEN_ONLY - {'BATCH_PIPELINE_UID_ALLOWLIST'})
+    | _FINALIZATION_REPLAY_LISTEN_ONLY,
 }
 
 # Pusher owns the process-local shadow worker; sync/backfill also runs the
@@ -343,12 +427,32 @@ PROD_FINAL_PASS_SHADOW_VALUES = {
 }
 
 PUSHER_ONLY_ALLOWED: dict[str, frozenset[str]] = {
-    "dev": frozenset({"GOOGLE_CLIENT_ID", "REDIS_DB_HOST", "TYPESENSE_HOST"}),
+    "dev": frozenset(
+        {
+            "GOOGLE_CLIENT_ID",
+            "REDIS_DB_HOST",
+            "TYPESENSE_HOST",
+            "PUSHER_STORAGE_PCM_BUDGET_MB",
+            # Only pusher owns the drained recording worker's producer-pending retry bound.
+            "PUSHER_RECORD_SEAL_PENDING_RETRY_BOUND_ENABLED",
+            "PUSHER_RECORD_SEAL_WAKE_ENABLED",
+        }
+    ),
     # Pusher retains its cloud/BYOK credential; listen has no managed cloud key.
     "prod": frozenset(
         {
+            # Only pusher owns the drained recording worker's producer-pending retry bound.
+            "PUSHER_RECORD_SEAL_PENDING_RETRY_BOUND_ENABLED",
+            "PUSHER_RECORD_SEAL_WAKE_ENABLED",
+            # Only pusher owns closed recording workers and their eviction proof.
+            "PUSHER_MAX_CLOSED_RECORD_DRAINS",
+            "PUSHER_ABANDON_EVICTED_TOKENS",
+            "PUSHER_MAX_ABANDON_RECORD_DRAINS",
+            "PUSHER_STORAGE_PCM_BUDGET_MB",
             # Late identity retries are scheduled only by prod pusher audio drain.
             "OWNER_IDENTITY_RETRY_COALESCE_ENABLED",
+            # Pusher alone writes PCM chunk batches (upload_audio_chunks_batch).
+            "AUDIO_ARCHIVE_REGIONAL_CHUNKS_PERCENT",
             "REDIS_DB_HOST",
             "TYPESENSE_HOST",
             # Process-local final-pass shadow is admitted only on the prod pusher.
@@ -521,6 +625,10 @@ def validate_preflight(root: Path = ROOT) -> list[str]:
                 f"listen={sorted(listen_from)} — co-hosts must share the same bulk source"
             )
 
+        for flag in sorted(_RECORD_LATENCY_LISTEN_ONLY):
+            if flag not in listen_env:
+                errors.append(f"[{env}] record latency flag {flag} missing on backend-listen")
+
         publisher = "FSR_QUEUE_AGE_PUBLISHER"
         pusher_publisher = pusher_env.get(publisher)
         listen_publisher = listen_env.get(publisher)
@@ -620,7 +728,7 @@ def validate_preflight(root: Path = ROOT) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or '').partition('\n')[0])
     parser.add_argument(
         "--root",
         type=Path,

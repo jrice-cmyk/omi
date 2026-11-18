@@ -17,6 +17,13 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+# build_incoming imports these lazily. Load at collection so the first
+# assignment does not pay unrelated provider/model imports in its CPU budget.
+import models.conversation  # noqa: F401
+import utils.conversations.deterministic_minimum  # noqa: F401
+import utils.stt.pre_recorded  # noqa: F401
+import utils.sync.capture  # noqa: F401
+
 from database.firestore_transaction_retry import FirestoreContentionExhausted
 from google.api_core import exceptions as api_exceptions
 
@@ -28,6 +35,7 @@ from utils.batch_pipeline import projection, projection_followup
 from utils.batch_pipeline.contracts import Priority, ProjectionBinding, WorkItem
 from utils.batch_pipeline.scheduler import owner_key
 from utils.batch_pipeline.serving import Serving
+from database.batch_pipeline_projection_finish import projection_finish_entry_fields
 from tests.unit.test_batch_pipeline_scheduler import MemoryStore
 
 BURST = 'burst-owner'
@@ -109,14 +117,45 @@ class ResultLog:
         }
 
     # --- FirestoreStore facade --------------------------------------------
-    def projection_page(self, limit=100, *, after=None, states=('pending', 'persisted', 'ready')):
+    def projection_page(
+        self,
+        limit=100,
+        *,
+        after=None,
+        states=('pending', 'persisted', 'ready'),
+        due_before=None,
+        exclude_async=False,
+        followup_due_before=None,
+    ):
+        if due_before is not None and followup_due_before is not None:
+            raise ValueError('finish and follow-up discovery clocks cannot be combined')
+        cutoff = followup_due_before if followup_due_before is not None else due_before
+        clock_field = 'projection_followup_due_at' if followup_due_before is not None else 'projection_finish_due_at'
+
+        def key(sid):
+            row = self.results[sid]
+            if cutoff is None:
+                return (row['committed_at'], sid)
+            return (row[clock_field], row['committed_at'], sid)
+
         rows = sorted(
-            (row['committed_at'], sid) for sid, row in self.results.items() if row['projection_state'] in states
+            (
+                key(sid)
+                for sid, row in self.results.items()
+                if row['projection_state'] in states
+                and (not exclude_async or due_before is None or row.get('projection_finish_due_at', -1) >= 0)
+                # Firestore range filters exclude a document missing the field;
+                # a missing clock is not due.
+                and (cutoff is None or (clock_field in row and row[clock_field] <= cutoff))
+            )
         )
         if after is not None:
-            rows = [row for row in rows if row > after]
+            if cutoff is not None and len(after) != 3 or cutoff is None and after[1] == '':
+                rows = [row for row in rows if row[0] >= after[0]]
+            else:
+                rows = [row for row in rows if row > after]
         page = rows[:limit]
-        return [sid for _, sid in page], (page[-1] if len(page) == limit else None)
+        return [row[-1] for row in page], (page[-1] if len(page) == limit else None)
 
     def projection_pending(self, limit=100):
         return self.projection_page(limit)[0]
@@ -150,6 +189,8 @@ class ResultLog:
 
         class Session:
             policy = SimpleNamespace(projection_contention=False, projection_timing=False)
+            # Mirrors ProjectionSession.now for the finish-backoff fields.
+            session_now = now
 
             def prepare(self, transaction, **_):
                 log.check(self)
@@ -160,18 +201,23 @@ class ResultLog:
             def persist(self, transaction, planned=None, **_):
                 return self.persist_empty()
 
-            def persist_empty(self, *, superseded=False, quarantined=False, privacy_deleted=False):
+            def persist_empty(self, *, superseded=False, quarantined=False, privacy_deleted=False, silence=False):
                 log.check(self)
                 receipt = {
-                    'state': 'quarantined' if quarantined else 'superseded' if superseded else 'persisted',
+                    'state': (
+                        'quarantined'
+                        if quarantined
+                        else 'superseded' if superseded else 'ready' if silence else 'persisted'
+                    ),
                     'conversation_id': None,
                     'enrichment_required': False,
                     'audio_required': False,
                 }
-                log.results[sid].update(
-                    projection=receipt,
-                    projection_state='quarantine_held' if quarantined else 'persisted',
-                )
+                state = 'quarantine_held' if quarantined else 'ready' if silence else 'persisted'
+                log.results[sid].update(projection=receipt, projection_state=state)
+                log.results[sid].pop('projection_finish_due_at', None)
+                log.results[sid].pop('projection_finish_backoff_step', None)
+                log.results[sid].update(projection_finish_entry_fields(state, self.session_now))
                 # Mirrors ProjectionSession.persist: a released held unit sits
                 # behind the watermark; its re-assignment must not drag the
                 # chain backward onto already-terminal rows.
@@ -190,7 +236,34 @@ class ResultLog:
     def ready(self, sid, binding, now, *, part_index=None, policy=None):
         receipt = {**(self.results[sid].get('projection') or {}), 'state': 'ready'}
         self.results[sid].update(projection=receipt, projection_state='ready')
+        self.results[sid].pop('projection_finish_due_at', None)
+        self.results[sid].pop('projection_finish_backoff_step', None)
+        self.results[sid].update(projection_finish_entry_fields('ready', now))
         return receipt
+
+    def projection_finish_backfill_complete(self):
+        return False
+
+    def retire_async_finish(self, sid):
+        if self.jobs[sid]['policy_parts']['projection']['async_projection'] and self.results[sid][
+            'projection_state'
+        ] in {'persisted', 'ready'}:
+            self.results[sid]['projection_finish_due_at'] = -1.0
+            return True
+        return False
+
+    def defer_finish(self, sid, state, now):
+        """Mirrors ProjectionStore.defer_finish: fence on the row's own state."""
+        from config.batch_pipeline import projection_finish_backoff_delay
+
+        row = self.results[sid]
+        if row.get('projection_state') != state:
+            return False
+        step = row.get('projection_finish_backoff_step')
+        step = min(step + 1, 2) if isinstance(step, int) and step >= 0 else 0
+        row.update(projection_finish_due_at=now + projection_finish_backoff_delay(step))
+        row['projection_finish_backoff_step'] = step
+        return True
 
     def check(self, session):
         row = self.results[session.segment_id]
@@ -269,13 +342,24 @@ def test_walk_follows_erased_receipts_and_resumes_after_watermark():
 
 
 def test_walk_is_bounded_by_rows_and_time(monkeypatch):
+    # This test controls row/time boundaries, independently of read-ahead I/O.
+    # With prefetch on, its third scripted tick expires take() before an async
+    # load completes, so scheduler timing determines whether a third row lands.
+    monkeypatch.setenv('BATCH_PIPELINE_PROJECTION_PREFETCH', '0')
     log = ResultLog()
     ids = chain(log, BURST, 'a', 5)
     projector = projector_for(log)
     projector.project_owner(BURST, limit=2)
     assert log.persist_order == ids[:2]
     ticks = itertools.chain([0.0, 0.0], itertools.repeat(2.0))
-    monkeypatch.setattr(projection.time, 'monotonic', lambda: next(ticks))
+    # Keep other threads and libraries from consuming this walk's clock ticks.
+    walk_thread = threading.get_ident()
+
+    def monotonic():
+        assert threading.get_ident() == walk_thread, 'walk clock consumed by another thread'
+        return next(ticks)
+
+    monkeypatch.setattr(projection, 'time', SimpleNamespace(monotonic=monotonic))
     projector.project_owner(BURST, budget_seconds=1.0)
     assert log.persist_order == ids[:3]
     projector.project_owner(BURST, limit=projection.OWNER_CHAIN_LIMIT, budget_seconds=60)
@@ -301,8 +385,8 @@ def test_walk_stops_at_first_fenced_row_and_never_skips_it():
     log.session = Mock(side_effect=RuntimeError('synthetic outage'))
     assert projector.project_owner(BURST) == []
     log.session = real
-    # The touched content's earlier persisted sibling is still owed a follow-up.
-    assert projector.project_owner(BURST) == ids
+    # The silent sibling is already ready; only the unassigned tail needs walking.
+    assert projector.project_owner(BURST) == ids[1:]
 
 
 # --- record-target conflicts cannot wedge the owner chain ------------------------
@@ -396,16 +480,16 @@ def test_discarded_record_silence_head_quarantines_and_advances(monkeypatch):
     assert log.projection_watermark(owner_key(BURST)) == ids[-1]
 
 
-def test_fresh_discarded_record_target_keeps_waiting(monkeypatch):
+def test_fresh_finalize_pending_record_target_keeps_waiting(monkeypatch):
     """Awaiting-writer conflicts on fresh rows keep waiting: the record may be
-    restored from discard, so the head stays pending and nothing quarantines."""
+    finalized by its writer, so the head stays pending and nothing quarantines."""
     from utils.sync.assignment_errors import SyncAssignmentConflictReason
 
     log = ResultLog()
     ids = [f'f-{n}' for n in range(2)]
     for sid in ids:
         log.commit(BURST, 'f', sid, ids, record=True, fresh_capture=True, outcome='success')
-    patch_conversation_assignment(monkeypatch, SyncAssignmentConflictReason.RECORD_TARGET_DISCARDED, fail_first_n=10)
+    patch_conversation_assignment(monkeypatch, SyncAssignmentConflictReason.RECORD_FINALIZE_PENDING, fail_first_n=10)
     projector = projector_for(log, lambda item, uri: dict(SUCCESS_PAYLOAD))
     assert projector.project_owner(BURST) == []
     assert log.persist_order == []
@@ -478,7 +562,7 @@ def test_generic_poison_head_holds_and_unblocks_the_chain():
     assert log.results[ids[0]]['projection_state'] == 'quarantine_held'
     assert log.results[ids[0]]['projection']['state'] == 'quarantined'
     assert log.jobs[ids[0]]['recovery_state'] == 'held'
-    assert log.results[ids[1]]['projection_state'] == 'persisted'
+    assert log.results[ids[1]]['projection_state'] == 'ready'
     assert log.projection_watermark(owner_key(BURST)) == ids[-1]
     # Held rows never arm retention: the hold path writes no expiry receipt.
     assert 'expires_at' not in log.results[ids[0]]
@@ -535,7 +619,7 @@ def test_fresh_awaiting_writer_conflict_is_bounded_not_forever(monkeypatch):
     ids = [f'fw-{n}' for n in range(2)]
     for sid in ids:
         log.commit(BURST, 'fw', sid, ids, record=True, fresh_capture=True, outcome='success')
-    patch_conversation_assignment(monkeypatch, SyncAssignmentConflictReason.RECORD_TARGET_DISCARDED, fail_first_n=10**6)
+    patch_conversation_assignment(monkeypatch, SyncAssignmentConflictReason.RECORD_FINALIZE_PENDING, fail_first_n=10**6)
     projector = projector_for(log, lambda item, uri: dict(SUCCESS_PAYLOAD))
     assert projector.project_owner(BURST) == []
     assert log.results[ids[0]]['projection_state'] == 'pending'

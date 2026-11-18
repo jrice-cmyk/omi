@@ -9,6 +9,12 @@
 - `tests/services/**/test_*.py`
 - `tests/routers/**/test_*.py`
 - top-level `tests/test_*.py` files that are still part of the unit suite
+- `scripts/jobstore_operator/tests/test_*.py` (portable offline controls)
+
+Any source, test or fixture change under `scripts/jobstore_operator/` selects
+the portable operator files through the existing CI runner, one pytest process
+per file. These fake-based tests do not execute Docker, Kubernetes or SQL and
+do not establish native-image qualification, production readiness or serving.
 
 For changed-file runs, use:
 
@@ -16,6 +22,31 @@ For changed-file runs, use:
 python scripts/select_backend_unit_tests.py --changed-files /tmp/changed-files --output /tmp/backend-tests
 BACKEND_UNIT_TEST_FILE_LIST=/tmp/backend-tests bash test.sh
 ```
+
+How changed-file selection decides (in order): explicit full-run inputs (lockfiles, `conftest.py`,
+`test.sh`, `main.py`, the selector itself) run everything; workflow contracts and area mappings add their
+tests; any other present, parseable Python module, including `database/`, `models/` and `tests/support/`
+helpers, selects the tests that can import it (`scripts/backend_import_graph.py`: module-level import
+closure, one lazy-import hop, `conftest.py` ancestors, literal `importlib` names); an unmapped data file
+selects tests reaching a module that names it. Deleted or unparseable modules, data files nothing names,
+and modules with no dependents still run the full suite. Every selection writes its reason.
+
+Controls, all on unless set to `0`/`false`/`off`:
+
+- `BACKEND_UNIT_GRAPH_SELECTION` (repository variable and local env): off restores the pre-graph
+  full-suite fallbacks.
+- `BACKEND_UNIT_MAIN_SELECTION` (repository variable): off makes every main push run `--all` again. When on,
+  a main push selects from the diff since the last green main push run plus a rotating 1/8 slice of the
+  suite (slice = green main run count mod 8); the nightly full run (`main_nightly_full.yml`) still runs all.
+- The `ci:full` PR label forces the full unit suite on that PR (add it, then re-run).
+
+Before changing selection rules, replay them over recent main history and quote the output:
+
+```bash
+python scripts/backtest_backend_unit_selection.py --limit 300 --json /tmp/selection-backtest.json
+```
+
+It exits nonzero if graph selection drops any test the legacy narrow selection picked.
 
 `BACKEND_PYTEST_MARK_EXPR` defaults to `not integration and not slow`, which is the PR unit-test lane.
 Use markers for tests that need live services, credentials, long waits, native stress paths, or broader
@@ -88,6 +119,15 @@ an exact-set pin — add its file to `tests/slow_guardrail_manifest.txt` so
 `scripts/run-slow-guardrails-ci.sh` runs it. That lane is unselected and unconditional by design: a check
 whose job is to notice a change nobody anticipated cannot be gated on the change set that triggered the run.
 Stress and network tests still belong in `slow` with no manifest entry.
+
+The timing-sensitive `test_soniox_recovery_retry.py` and
+`test_live_replay_provider_pairs.py` files use that same `slow` marker while
+SCA-1998 and SCA-1999 track deterministic rewrites. `Backend slow timing tests`
+executes both files in separate jobs on every main push, without path filtering
+or concurrency coalescing. Its failures are visible as red checks with JUnit
+artifacts; it is independent of the required `Backend unit suite` PR check.
+Keep these files out of the blocking slow-guardrail manifest. When restoring
+their PR coverage, remove each marker and its workflow matrix entry together.
 
 ## Asana project chooser regression
 
